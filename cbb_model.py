@@ -561,6 +561,9 @@ def main():
             ds = d.strftime("%Y%m%d"); n = fetch_espn(con, ds)
             if n and d == date.today() - timedelta(days=1): load_torvik(con)
             print(ds, n, "games,", grade_date(con, ds), "graded"); d += timedelta(days=1)
+        t = date.today().strftime("%Y%m%d")   # re-predict today's games (and their flags)
+        fetch_espn(con, t); predict_date(con, t)
+        print(t, "today's games re-predicted")
         print(report(con)); print(unmatched_text(con))
         export_site(con)
     elif cmd == "daily":
