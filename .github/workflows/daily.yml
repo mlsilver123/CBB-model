@@ -5,19 +5,31 @@ on:
   workflow_dispatch:          # adds a "Run workflow" button for running it by hand
     inputs:
       command:
-        description: "Command (daily, backfill 20261101, unmatched, accept, report)"
+        description: "Command (daily, backfill 20261102, unmatched, accept, report)"
         default: "daily"
+permissions:
+  contents: read
+  pages: write                # lets this job publish the GitHub Pages site
+  id-token: write
+concurrency: { group: cbb-model, cancel-in-progress: false }
 jobs:
   run:
     runs-on: ubuntu-latest
+    environment: { name: github-pages, url: "${{ steps.deploy.outputs.page_url }}" }
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -r requirements.txt
       - run: python cbb_model.py ${{ github.event.inputs.command || 'daily' }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: daily-report, path: "report_*.txt", if-no-files-found: ignore }
+      # Publish the website with the latest data
+      - run: python cbb_model.py site
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+      - id: deploy
+        uses: actions/deploy-pages@v4
