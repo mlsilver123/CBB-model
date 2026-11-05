@@ -65,6 +65,16 @@ NAME_FIXES = {
     "SIU Edwardsville": "SIU Edwardsville", "Arkansas Pine Bluff": "Arkansas-Pine Bluff",
     "Bethune Cookman": "Bethune-Cookman", "Gardner Webb": "Gardner-Webb",
     "Loyola MD": "Loyola Maryland", "St. Thomas": "St. Thomas-Minnesota",
+    # Confirmed from the first backfill (ESPN's names)
+    "Albany": "UAlbany", "Cal Baptist": "California Baptist", "Seattle": "Seattle U",
+    "Grambling St.": "Grambling", "McNeese St.": "McNeese", "Nicholls St.": "Nicholls",
+    "Sam Houston St.": "Sam Houston", "San Jose St.": "San José State",
+    # ESPN's usual names; these link automatically once the team appears in ESPN's feed
+    "Appalachian St.": "App State", "LIU": "Long Island University", "UMKC": "Kansas City",
+    "Mississippi Valley St.": "Mississippi Valley State", "Tennessee Martin": "UT Martin",
+    "Southeastern Louisiana": "SE Louisiana", "USC Upstate": "South Carolina Upstate",
+    "FIU": "Florida International", "Queens": "Queens University", "Penn": "Pennsylvania",
+    "American": "American University",
 }
 
 def season_year(d=None):
@@ -113,66 +123,90 @@ class DB:
             if stmt.strip(): self.execute(stmt)
         self.commit()
 
+        self.load_cache()
+
     def execute(self, sql, params=()):
         cur = self.con.cursor()
         cur.execute(sql.replace("?", "%s") if self.pg else sql, params)
         return cur
 
+    def executemany(self, sql, rows):
+        """Send many writes at once. Over the internet to Supabase, each separate
+        request takes a noticeable fraction of a second, so batching matters."""
+        rows = list(rows)
+        if not rows: return
+        cur = self.con.cursor()
+        if self.pg:
+            from psycopg2.extras import execute_batch
+            execute_batch(cur, sql.replace("?", "%s"), rows, page_size=500)
+        else:
+            cur.executemany(sql, rows)
+
+    def load_cache(self):
+        """Small tables are read once per run and kept in memory."""
+        q = lambda sql: self.execute(sql).fetchall()
+        self.meta = dict(q("SELECT k, v FROM meta"))
+        self.ratings = {t: [o, d, g] for t, o, d, g in q("SELECT team, off, def, games FROM teams")}
+        self.torvik = {t: (o, d, tp) for t, o, d, tp in q("SELECT team, adjoe, adjde, adjt FROM torvik")}
+        self.alias = {(s, a): t for s, a, t in q("SELECT source, alias, team_id FROM team_alias")}
+        self.names = {t: n for t, n in q("SELECT team_id, name FROM team_master")}
+        self.espn = {e: t for t, e in q("SELECT team_id, espn_id FROM team_master")}
+        self.new_teams = []
+
     def commit(self): self.con.commit()
 
 def league_avg(con):
-    r = con.execute("SELECT v FROM meta WHERE k='avg'").fetchone()
-    return r[0] if r else LEAGUE_AVG_PTS
+    return con.meta.get("avg", LEAGUE_AVG_PTS)
 
 def set_meta(con, k, v):
+    con.meta[k] = v
     con.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
 
 # ----------------------------- team crosswalk ---------------------------
 FIRST_ID = 100001
 
 def norm(s):
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()   # José -> Jose
     s = s.replace("St.", "State").replace("&", "and")
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 def espn_team_id(con, espn_id, name):
     """ESPN is the anchor: its numeric team IDs never change. A new ESPN team gets a
     new permanent ID of ours. Its ESPN name is also stored as an alias."""
-    r = con.execute("SELECT team_id FROM team_master WHERE espn_id=?", (str(espn_id),)).fetchone()
-    if r:
-        tid = r[0]
-    else:
-        last = con.execute("SELECT MAX(CAST(team_id AS INTEGER)) FROM team_master").fetchone()[0]
-        tid = str((last or FIRST_ID - 1) + 1)
-        con.execute("INSERT INTO team_master(team_id,name,espn_id) VALUES(?,?,?)",
-                    (tid, name, str(espn_id)))
-    add_alias(con, "espn", str(espn_id), tid)
-    add_alias(con, "espn_name", name, tid)
+    eid = str(espn_id)
+    tid = con.espn.get(eid)
+    if not tid:
+        tid = str(max([int(t) for t in con.names] or [FIRST_ID - 1]) + 1)
+        con.execute("INSERT INTO team_master(team_id,name,espn_id) VALUES(?,?,?)", (tid, name, eid))
+        con.espn[eid], con.names[tid] = tid, name
+    if con.alias.get(("espn", eid)) != tid: add_alias(con, "espn", eid, tid)
+    if con.alias.get(("espn_name", name)) != tid: add_alias(con, "espn_name", name, tid)
     return tid
 
 def add_alias(con, source, alias, tid):
     con.execute("""INSERT INTO team_alias(source,alias,team_id) VALUES(?,?,?)
                    ON CONFLICT(source,alias) DO UPDATE SET team_id=excluded.team_id""",
                 (source, alias, tid))
-    con.execute("DELETE FROM unmatched WHERE source=? AND alias=?", (source, alias))
+    con.alias[(source, alias)] = tid
 
 def resolve(con, source, alias):
     """Return our team ID for a source's name, or None (and log it) if unknown.
     Order: confirmed alias -> known fix -> exact match after cleanup -> unmatched."""
-    r = con.execute("SELECT team_id FROM team_alias WHERE source=? AND alias=?",
-                    (source, alias)).fetchone()
-    if r: return r[0]
-    names = con.execute("SELECT alias, team_id FROM team_alias WHERE source='espn_name'").fetchall()
+    if (source, alias) in con.alias: return con.alias[(source, alias)]
+    names = [(a, t) for (s, a), t in con.alias.items() if s == "espn_name"]
     if source == "torvik" and alias in NAME_FIXES:
         hit = [t for a, t in names if a == NAME_FIXES[alias]]
         if hit: add_alias(con, source, alias, hit[0]); return hit[0]
     # Exact match once punctuation/"St." are cleaned up, against any source's alias
-    every = con.execute("SELECT alias, team_id FROM team_alias WHERE source != 'espn'").fetchall()
-    hits = {t for a, t in every if norm(a) == norm(alias)}
+    every = [(a, t) for (s, a), t in con.alias.items() if s != "espn"]
+    tries = {norm(alias), norm(re.sub(r" St\.$", "", alias))}   # "McNeese St." -> "McNeese"
+    hits = {t for a, t in every if norm(a) in tries}
     if len(hits) == 1:
         tid = hits.pop(); add_alias(con, source, alias, tid); return tid
     # Unknown: log it with a best guess, but don't use it until it's confirmed
     by_norm = {norm(a): (t, a) for a, t in names}
-    close = difflib.get_close_matches(norm(alias), list(by_norm), n=1, cutoff=0.6)
+    close = difflib.get_close_matches(norm(alias), list(by_norm), n=1, cutoff=0.8)
     sid, sname = by_norm[close[0]] if close else (None, None)
     con.execute("""INSERT INTO unmatched(source,alias,suggested_id,suggested_name,first_seen)
                    VALUES(?,?,?,?,?) ON CONFLICT(source,alias) DO NOTHING""",
@@ -180,8 +214,7 @@ def resolve(con, source, alias):
     return None
 
 def team_name(con, tid):
-    r = con.execute("SELECT name FROM team_master WHERE team_id=?", (tid,)).fetchone()
-    return r[0] if r else str(tid)
+    return con.names.get(tid, str(tid))
 
 def unmatched(con):
     # Clear anything you've since mapped by hand (e.g. a row added in Supabase's table editor)
@@ -198,20 +231,27 @@ def export_crosswalk(con, path):
     return len(rows)
 
 def team(con, name):
-    r = con.execute("SELECT off, def, games FROM teams WHERE team=?", (name,)).fetchone()
-    if r: return r
+    if name in con.ratings: return con.ratings[name]
     # New team: start from Barttorvik ratings if we have them, otherwise average
-    tv = con.execute("SELECT adjoe, adjde, adjt FROM torvik WHERE team=?", (name,)).fetchone()
-    avg = con.execute("SELECT v FROM meta WHERE k='tv_eff'").fetchone()
+    tv, avg = con.torvik.get(name), con.meta.get("tv_eff")
     if tv and avg:
         scale = tv[2] / 100                       # per-100-possession -> per-game points
-        off, de, g = (tv[0] - avg[0]) * scale, (avg[0] - tv[1]) * scale, SEEDED_GAMES
+        off, de, g = (tv[0] - avg) * scale, (avg - tv[1]) * scale, SEEDED_GAMES
     elif avg:                                 # Torvik loaded but no row: non-Division I school
         off, de, g = NON_D1_RATING, NON_D1_RATING, SEEDED_GAMES
     else:
         off, de, g = 0.0, 0.0, 0
-    con.execute("INSERT INTO teams(team,off,def,games) VALUES(?,?,?,?)", (name, off, de, g))
-    return (off, de, g)
+    con.ratings[name] = [off, de, g]
+    con.new_teams.append(name)
+    return con.ratings[name]
+
+def save_ratings(con, names):
+    """Write changed team ratings back to the database in one batch."""
+    new = set(con.new_teams); con.new_teams = []
+    con.executemany("INSERT INTO teams(team,off,def,games) VALUES(?,?,?,?) ON CONFLICT(team) DO NOTHING",
+                    [(t, *con.ratings[t]) for t in new])
+    con.executemany("UPDATE teams SET off=?, def=?, games=? WHERE team=?",
+                    [(*con.ratings[t], t) for t in set(names)])
 
 # ----------------------------- data in ----------------------------------
 def get(url):
@@ -222,7 +262,7 @@ def get(url):
 def fetch_espn(con, d):
     """Pull games, finals and betting lines for date d (YYYYMMDD) from ESPN."""
     data = json.loads(get(ESPN.format(d=d)))
-    n = 0
+    batch = []
     for ev in data.get("events", []):
         c = ev["competitions"][0]
         side = {t["homeAway"]: t for t in c["competitors"]}
@@ -236,20 +276,21 @@ def fetch_espn(con, d):
         if c.get("odds"):
             o = c["odds"][0]
             spread, total = o.get("spread"), o.get("overUnder")
-        upsert_game(con, ev["id"], d, name("home"), name("away"),
-                    int(c.get("neutralSite", False)), hp, ap, final, spread, total)
-        n += 1
+        batch.append((ev["id"], d, name("home"), name("away"),
+                      int(c.get("neutralSite", False)), hp, ap, final, spread, total))
+    con.executemany(GAME_UPSERT, batch)
     con.commit()
-    return n
+    return len(batch)
 
 def upsert_game(con, gid, d, home, away, neutral, hp, ap, final, spread, total):
-    con.execute("""INSERT INTO games(game_id,date,home,away,neutral,home_pts,away_pts,final,
+    con.execute(GAME_UPSERT, (gid, d, home, away, neutral, hp, ap, final, spread, total))
+
+GAME_UPSERT = ("""INSERT INTO games(game_id,date,home,away,neutral,home_pts,away_pts,final,
                    vegas_spread,vegas_total) VALUES(?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(game_id) DO UPDATE SET home_pts=excluded.home_pts,
                    away_pts=excluded.away_pts, final=excluded.final, neutral=excluded.neutral,
                    vegas_spread=COALESCE(games.vegas_spread, excluded.vegas_spread),
-                   vegas_total=COALESCE(games.vegas_total, excluded.vegas_total)""",
-                (gid, d, home, away, neutral, hp, ap, final, spread, total))
+                   vegas_total=COALESCE(games.vegas_total, excluded.vegas_total)""")
 
 def import_lines(con, path):
     """Team names in the CSV go through the crosswalk (source "lines")."""
@@ -277,17 +318,19 @@ def load_torvik(con, path=None):
             print(f"Torvik download failed ({e}) and no {local} in the repo; skipping Torvik")
             return 0
     rows = [r for r in csv.DictReader(io.StringIO(text)) if r.get("team")]
+    confs, batch = [], []
     for r in rows:
         tid = resolve(con, "torvik", r["team"])
         if not tid: continue                   # logged in unmatched until you link it
-        if r.get("conf"):
-            con.execute("UPDATE team_master SET conf=? WHERE team_id=?", (r["conf"], tid))
-        con.execute("""INSERT INTO torvik(team,torvik_name,adjoe,adjde,adjt,barthag,updated)
+        if r.get("conf"): confs.append((r["conf"], tid))
+        o, d, t = float(r["adjoe"]), float(r["adjde"]), float(r["adjt"])
+        con.torvik[tid] = (o, d, t)
+        batch.append((tid, r["team"], o, d, t, float(r["barthag"]), date.today().isoformat()))
+    con.executemany("UPDATE team_master SET conf=? WHERE team_id=?", confs)
+    con.executemany("""INSERT INTO torvik(team,torvik_name,adjoe,adjde,adjt,barthag,updated)
                        VALUES(?,?,?,?,?,?,?) ON CONFLICT(team) DO UPDATE SET
                        torvik_name=excluded.torvik_name, adjoe=excluded.adjoe, adjde=excluded.adjde,
-                       adjt=excluded.adjt, barthag=excluded.barthag, updated=excluded.updated""",
-                    (tid, r["team"], float(r["adjoe"]), float(r["adjde"]),
-                     float(r["adjt"]), float(r["barthag"]), date.today().isoformat()))
+                       adjt=excluded.adjt, barthag=excluded.barthag, updated=excluded.updated""", batch)
     set_meta(con, "tv_eff", sum(float(r["adjoe"]) for r in rows) / len(rows))
     set_meta(con, "tv_tempo", sum(float(r["adjt"]) for r in rows) / len(rows))
     con.commit()
@@ -295,15 +338,13 @@ def load_torvik(con, path=None):
 
 def torvik_predict(con, home, away, neutral):
     """Rebuild a T-Rank-style line from Torvik's ratings. None if a team is missing."""
-    h = con.execute("SELECT adjoe,adjde,adjt FROM torvik WHERE team=?", (home,)).fetchone()
-    a = con.execute("SELECT adjoe,adjde,adjt FROM torvik WHERE team=?", (away,)).fetchone()
-    eff = con.execute("SELECT v FROM meta WHERE k='tv_eff'").fetchone()
-    tmp = con.execute("SELECT v FROM meta WHERE k='tv_tempo'").fetchone()
+    h, a = con.torvik.get(home), con.torvik.get(away)
+    eff, tmp = con.meta.get("tv_eff"), con.meta.get("tv_tempo")
     if not (h and a and eff and tmp): return None
-    poss = h[2] * a[2] / tmp[0]
+    poss = h[2] * a[2] / tmp
     edge = 0 if neutral else TORVIK_HOME_EDGE
-    ph = h[0] * a[1] / eff[0] * poss / 100 * (1 + edge)
-    pa = a[0] * h[1] / eff[0] * poss / 100 * (1 - edge)
+    ph = h[0] * a[1] / eff * poss / 100 * (1 + edge)
+    pa = a[0] * h[1] / eff * poss / 100 * (1 - edge)
     return ph, pa
 
 # ----------------------------- the model --------------------------------
@@ -321,6 +362,7 @@ def tier(edge, tiers):
 def predict_date(con, d):
     rows = con.execute("""SELECT game_id,home,away,neutral,vegas_spread,vegas_total FROM games
                           WHERE date=? AND graded=0""", (d,)).fetchall()
+    batch = []
     for gid, home, away, neu, vs, vt in rows:
         ph, pa = predict_game(con, home, away, neu)
         ps, pt = -(ph - pa), ph + pa
@@ -336,11 +378,12 @@ def predict_date(con, d):
             te = pt - vt
             tt = tier(te, TOTAL_TIERS)
             tp = ("OVER" if te > 0 else "UNDER") if tt else None
-        con.execute("""UPDATE games SET pred_home=?,pred_away=?,pred_spread=?,pred_total=?,
+        batch.append((ph, pa, ps, pt, th, ta, ts, tt_, se, st, sp, te, tt, tp, gid))
+    con.executemany("""UPDATE games SET pred_home=?,pred_away=?,pred_spread=?,pred_total=?,
                        tv_home=?,tv_away=?,tv_spread=?,tv_total=?,
                        spread_edge=?,spread_tier=?,spread_pick=?,total_edge=?,total_tier=?,total_pick=?
-                       WHERE game_id=?""",
-                    (ph, pa, ps, pt, th, ta, ts, tt_, se, st, sp, te, tt, tp, gid))
+                       WHERE game_id=?""", batch)
+    save_ratings(con, [])                      # first-seen teams get their starting rating saved
     con.commit()
     return len(rows)
 
@@ -351,17 +394,20 @@ def grade_date(con, d):
         predict_date(con, d)                   # backfill: predict before learning from it
     rows = con.execute("""SELECT game_id,home,away,neutral,home_pts,away_pts FROM games
                           WHERE date=? AND final=1 AND graded=0""", (d,)).fetchall()
+    touched = []
     for gid, home, away, neu, hp, ap in rows:
         ph, pa = predict_game(con, home, away, neu)
         eh, ea = hp - ph, ap - pa
         for name, err_for, err_against in ((home, eh, ea), (away, ea, eh)):
-            o, de, g = team(con, name)
-            k = max(K_MIN, K_START / (1 + g / K_DECAY_GAMES))
-            con.execute("UPDATE teams SET off=?, def=?, games=games+1 WHERE team=?",
-                        (o + k * err_for, de - k * err_against, name))
+            r = team(con, name)
+            k = max(K_MIN, K_START / (1 + r[2] / K_DECAY_GAMES))
+            r[0] += k * err_for; r[1] -= k * err_against; r[2] += 1
+            touched.append(name)
         avg = league_avg(con)
-        set_meta(con, "avg", avg + 0.01 * ((hp + ap) / 2 - avg))
-        con.execute("UPDATE games SET graded=1 WHERE game_id=?", (gid,))
+        con.meta["avg"] = avg + 0.01 * ((hp + ap) / 2 - avg)
+    if rows: set_meta(con, "avg", con.meta["avg"])
+    save_ratings(con, touched)
+    con.executemany("UPDATE games SET graded=1 WHERE game_id=?", [(r[0],) for r in rows])
     con.commit()
     return len(rows)
 
@@ -454,6 +500,7 @@ def main():
         d = date(int(arg[:4]), int(arg[4:6]), int(arg[6:]))
         if "reset" in args:                    # start the season over: clear ratings and grades
             con.execute("DELETE FROM teams"); con.execute("DELETE FROM meta WHERE k='avg'")
+            con.ratings = {}; con.meta.pop("avg", None)
             con.execute("""UPDATE games SET graded=0, pred_home=NULL, pred_away=NULL,
                            pred_spread=NULL, pred_total=NULL, tv_home=NULL, tv_away=NULL,
                            tv_spread=NULL, tv_total=NULL, spread_tier=NULL, spread_pick=NULL,
