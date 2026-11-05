@@ -78,6 +78,16 @@ NAME_FIXES = {
     "American": "American University",
 }
 
+# Teams to create up front, before they appear in ESPN's feed, so Barttorvik's ratings
+# link right away. Torvik name -> (ESPN team ID, ESPN name). The ESPN ID is the number
+# after /id/ in the team's ESPN page address.
+KNOWN_TEAMS = {
+    "Rutgers": ("164", "Rutgers"),
+    "Detroit Mercy": ("2174", "Detroit Mercy"),
+    "Mississippi Valley St.": ("2400", "Mississippi Valley State"),
+    "New Orleans": ("2443", "LSU New Orleans"),
+}
+
 def season_year(d=None):
     d = d or date.today()
     return d.year + 1 if d.month >= 7 else d.year   # Torvik labels by the year it ends
@@ -210,7 +220,8 @@ def resolve(con, source, alias):
     close = difflib.get_close_matches(norm(alias), list(by_norm), n=1, cutoff=0.8)
     sid, sname = by_norm[close[0]] if close else (None, None)
     con.execute("""INSERT INTO unmatched(source,alias,suggested_id,suggested_name,first_seen)
-                   VALUES(?,?,?,?,?) ON CONFLICT(source,alias) DO NOTHING""",
+                   VALUES(?,?,?,?,?) ON CONFLICT(source,alias) DO UPDATE SET
+                   suggested_id=excluded.suggested_id, suggested_name=excluded.suggested_name""",
                 (source, alias, sid, sname, date.today().isoformat()))
     return None
 
@@ -319,6 +330,8 @@ def load_torvik(con, path=None):
             print(f"Torvik download failed ({e}) and no {local} in the repo; skipping Torvik")
             return 0
     rows = [r for r in csv.DictReader(io.StringIO(text)) if r.get("team")]
+    for tv_name, (eid, espn_name) in KNOWN_TEAMS.items():
+        add_alias(con, "torvik", tv_name, espn_team_id(con, eid, espn_name))
     confs, batch = [], []
     for r in rows:
         tid = resolve(con, "torvik", r["team"])
