@@ -11,6 +11,7 @@ Other commands:
     python cbb_model.py torvik [file]    # pull Torvik ratings (or read a downloaded CSV)
     python cbb_model.py backfill 20261102 # load and grade every day from a date to yesterday
     python cbb_model.py backfill 20261102 reset  # same, but wipe ratings first and rebuild
+    python cbb_model.py site             # write site/data.json for the website
     python cbb_model.py report           # season accuracy + record by edge tier
     python cbb_model.py lines lines.csv  # override lines (columns: date,home,away,spread,total)
 
@@ -458,6 +459,41 @@ def report(con):
             out.append(f"{kind:6} {label:6}: {w}-{l}  ({pct})   breakeven at -110 is 52.4%")
     return "\n".join(out)
 
+# ----------------------------- website export ---------------------------
+def export_site(con, outdir="site"):
+    """Write site/data.json for the GitHub Pages dashboard (site/index.html)."""
+    rows = con.execute("""SELECT date, home, away, neutral, final, home_pts, away_pts,
+                          pred_home, pred_away, pred_spread, pred_total, tv_spread, tv_total,
+                          vegas_spread, vegas_total, spread_edge, spread_tier, spread_pick,
+                          total_edge, total_tier, total_pick FROM games ORDER BY date""").fetchall()
+    conf = dict(con.execute("SELECT team_id, conf FROM team_master").fetchall())
+    r1 = lambda x: None if x is None else round(float(x), 1)
+    games = []
+    for (d, h, a, neu, fin, hp, ap, ph, pa, ps, pt, tvs, tvt, vs, vt,
+         se, st, sp, te, tt, tp) in rows:
+        g = {"date": d, "home": team_name(con, h), "away": team_name(con, a),
+             "hc": conf.get(h), "ac": conf.get(a), "n": int(neu or 0), "final": int(fin or 0),
+             "hp": hp, "ap": ap, "ph": r1(ph), "pa": r1(pa), "ps": r1(ps), "pt": r1(pt),
+             "tvs": r1(tvs), "tvt": r1(tvt), "vs": r1(vs), "vt": r1(vt),
+             "st": st, "sp": team_name(con, sp) if sp else None, "tt": tt, "tp": tp}
+        if fin and hp is not None:             # results vs Vegas for flagged picks
+            if st and vs is not None:
+                c = ((hp - ap) + vs) * (1 if sp == h else -1)
+                g["sr"] = "W" if c > 0 else "L" if c < 0 else "P"
+            if tt and vt is not None:
+                o = ((hp + ap) - vt) * (1 if tp == "OVER" else -1)
+                g["tr"] = "W" if o > 0 else "L" if o < 0 else "P"
+        games.append(g)
+    teams = [{"name": team_name(con, t), "conf": conf.get(t), "off": r1(o), "def": r1(d), "g": n,
+              "tvo": r1(con.torvik.get(t, (None,) * 3)[0]), "tvd": r1(con.torvik.get(t, (None,) * 3)[1]),
+              "tvt": r1(con.torvik.get(t, (None,) * 3)[2])}
+             for t, (o, d, n) in con.ratings.items()]
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "data.json"), "w") as f:
+        json.dump({"updated": date.today().isoformat(), "games": games, "teams": teams}, f,
+                  separators=(",", ":"))
+    return len(games)
+
 # ----------------------------- CLI --------------------------------------
 def unmatched_text(con):
     rows = unmatched(con)
@@ -495,6 +531,7 @@ def main():
         q = norm(" ".join(args[1:]))
         for tid, name, conf in con.execute("SELECT team_id,name,conf FROM team_master ORDER BY name").fetchall():
             if q in norm(name): print(tid, name, conf or "")
+    elif cmd == "site":      print(export_site(con, arg or "site"), "games written to the site")
     elif cmd == "crosswalk": print(export_crosswalk(con, arg or "crosswalk.csv"), "rows written")
     elif cmd == "backfill":                    # e.g. backfill 20261102: load every day up to yesterday
         d = date(int(arg[:4]), int(arg[4:6]), int(arg[6:]))
@@ -512,6 +549,7 @@ def main():
             if n and d == date.today() - timedelta(days=1): load_torvik(con)
             print(ds, n, "games,", grade_date(con, ds), "graded"); d += timedelta(days=1)
         print(report(con)); print(unmatched_text(con))
+        export_site(con)
     elif cmd == "daily":
         today = date.today(); yday = today - timedelta(days=1)
         y, t = yday.strftime("%Y%m%d"), today.strftime("%Y%m%d")
@@ -524,6 +562,7 @@ def main():
         con.commit()
         print(text)
         open(f"report_{t}.txt", "w").write(text)
+        export_site(con)
     else: print(__doc__)
 
 if __name__ == "__main__":
