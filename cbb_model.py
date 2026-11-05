@@ -10,6 +10,7 @@ Other commands:
     python cbb_model.py predict 20261105 # predict a date and flag edges vs Vegas
     python cbb_model.py torvik [file]    # pull Torvik ratings (or read a downloaded CSV)
     python cbb_model.py backfill 20261102 # load and grade every day from a date to yesterday
+    python cbb_model.py backfill 20261102 reset  # same, but wipe ratings first and rebuild
     python cbb_model.py report           # season accuracy + record by edge tier
     python cbb_model.py lines lines.csv  # override lines (columns: date,home,away,spread,total)
 
@@ -38,6 +39,7 @@ HOME_COURT = 3.0             # our model: points of home advantage (0 at neutral
 TORVIK_HOME_EDGE = 0.014     # Torvik-style: home offense +1.4%, away offense -1.4%
 K_START, K_MIN = 0.40, 0.10  # learning rate: big early, shrinks as a team plays more
 K_DECAY_GAMES = 8
+NON_D1_RATING = -10.0        # points: teams missing from Torvik's file (non-Division I)
 SEEDED_GAMES = 4             # a Torvik-seeded team starts as if it had played this many
                              # games, so early results don't wipe out the seed
 # Edge tiers: |model - Vegas| in points, checked from biggest to smallest
@@ -204,6 +206,8 @@ def team(con, name):
     if tv and avg:
         scale = tv[2] / 100                       # per-100-possession -> per-game points
         off, de, g = (tv[0] - avg[0]) * scale, (avg[0] - tv[1]) * scale, SEEDED_GAMES
+    elif avg:                                 # Torvik loaded but no row: non-Division I school
+        off, de, g = NON_D1_RATING, NON_D1_RATING, SEEDED_GAMES
     else:
         off, de, g = 0.0, 0.0, 0
     con.execute("INSERT INTO teams(team,off,def,games) VALUES(?,?,?,?)", (name, off, de, g))
@@ -263,15 +267,14 @@ def import_lines(con, path):
 # ----------------------------- Barttorvik -------------------------------
 def load_torvik(con, path=None):
     """Pull Torvik's team ratings (or read a CSV you downloaded by hand)."""
-    try:
-        text = open(path).read() if path else get(TORVIK.format(y=season_year()))
-    except Exception as e:
-        local = f"torvik_{season_year()}.csv"
-        if os.path.exists(local):
-            print(f"Torvik download failed ({e}); using {local}")
-            text = open(local).read()
-        else:
-            print(f"Torvik download failed ({e}); skipping Torvik today")
+    local = path or f"torvik_{season_year()}.csv"
+    if os.path.exists(local):
+        text = open(local).read()             # a file you downloaded and uploaded to the repo
+    else:
+        try:
+            text = get(TORVIK.format(y=season_year()))
+        except Exception as e:
+            print(f"Torvik download failed ({e}) and no {local} in the repo; skipping Torvik")
             return 0
     rows = [r for r in csv.DictReader(io.StringIO(text)) if r.get("team")]
     for r in rows:
@@ -449,9 +452,17 @@ def main():
     elif cmd == "crosswalk": print(export_crosswalk(con, arg or "crosswalk.csv"), "rows written")
     elif cmd == "backfill":                    # e.g. backfill 20261102: load every day up to yesterday
         d = date(int(arg[:4]), int(arg[4:6]), int(arg[6:]))
+        if "reset" in args:                    # start the season over: clear ratings and grades
+            con.execute("DELETE FROM teams"); con.execute("DELETE FROM meta WHERE k='avg'")
+            con.execute("""UPDATE games SET graded=0, pred_home=NULL, pred_away=NULL,
+                           pred_spread=NULL, pred_total=NULL, tv_home=NULL, tv_away=NULL,
+                           tv_spread=NULL, tv_total=NULL, spread_tier=NULL, spread_pick=NULL,
+                           total_tier=NULL, total_pick=NULL""")
+            print("Ratings reset; rebuilding from", arg)
         load_torvik(con)
         while d < date.today():
-            ds = d.strftime("%Y%m%d"); n = fetch_espn(con, ds); load_torvik(con) if n else None
+            ds = d.strftime("%Y%m%d"); n = fetch_espn(con, ds)
+            if n and d == date.today() - timedelta(days=1): load_torvik(con)
             print(ds, n, "games,", grade_date(con, ds), "graded"); d += timedelta(days=1)
         print(report(con)); print(unmatched_text(con))
     elif cmd == "daily":
