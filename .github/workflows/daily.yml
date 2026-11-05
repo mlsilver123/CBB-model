@@ -1,0 +1,23 @@
+name: Daily CBB model
+on:
+  schedule:
+    - cron: "0 11 * * *"      # 11:00 UTC = 6:00am EST (7:00am once daylight saving time starts)
+  workflow_dispatch:          # adds a "Run workflow" button for running it by hand
+    inputs:
+      command:
+        description: "Command (daily, backfill 20261101, unmatched, accept, report)"
+        default: "daily"
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python cbb_model.py ${{ github.event.inputs.command || 'daily' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: daily-report, path: "report_*.txt", if-no-files-found: ignore }
